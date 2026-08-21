@@ -1,0 +1,25 @@
+name = "anivault-status"
+main = "src/index.ts"
+compatibility_date = "2024-09-01"
+
+# Create with: wrangler d1 create anivault-status
+# Then paste the returned database_id below.
+[[d1_databases]]
+binding = "DB"
+database_name = "anivault-status"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+# Pings both services every 2 minutes. 720 checks/day/service — cheap for D1,
+# and deliberately NOT KV (see src/index.ts comment: writing to KV from here
+# would eat into the same account-wide write quota that caused the original
+# outage this status page exists to catch).
+[triggers]
+crons = ["*/2 * * * *"]
+
+# After first deploy, attach the custom domain in the dashboard:
+# Workers & Pages → anivault-status → Settings → Domains & Routes → Add
+# → status.anivault.co
+# (or uncomment and adjust if you'd rather manage it as code):
+# [[routes]]
+# pattern = "status.anivault.co/*"
+# custom_domain = true
