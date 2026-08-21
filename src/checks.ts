@@ -6,14 +6,15 @@ export interface ServiceDef {
   id: string;
   name: string;
   url: string;
+  openUrl: string; // the human-facing site, for the "Open X" link
 }
 
-// AniVault's web healthz deliberately avoids the MalAPI/season code path —
-// see anivault (main site repo) src/routes/health.ts. Scraper's /api/health
-// already existed and is similarly cheap/read-only.
+// Both anivault.co (src/routes/health.ts) and api.anivault.co
+// (src/routes.ts /health) return the same shape:
+//   { status: 'ok'|'degraded'|'down', checks: {...}, external?: {...}, meta?: {...} }
 export const SERVICES: ServiceDef[] = [
-  { id: 'web', name: 'AniVault Website', url: 'https://anivault.co/healthz' },
-  { id: 'api', name: 'AniVault API', url: 'https://api.anivault.co/api/health' },
+  { id: 'web', name: 'AniVault Website', url: 'https://anivault.co/healthz', openUrl: 'https://anivault.co' },
+  { id: 'api', name: 'AniVault API', url: 'https://api.anivault.co/health', openUrl: 'https://api.anivault.co' },
 ];
 
 const CHECK_TIMEOUT_MS = 8000;
@@ -21,9 +22,11 @@ const RETENTION_DAYS = 90;
 
 export interface CheckResult {
   ok: boolean;
+  degraded: boolean;
   statusCode: number | null;
   responseMs: number;
   error: string | null;
+  body: string | null;
 }
 
 export async function probe(service: ServiceDef): Promise<CheckResult> {
@@ -37,23 +40,59 @@ export async function probe(service: ServiceDef): Promise<CheckResult> {
       cf: { cacheTtl: 0, cacheEverything: false },
     });
     clearTimeout(t);
-    return { ok: res.ok, statusCode: res.status, responseMs: Date.now() - start, error: null };
+    const responseMs = Date.now() - start;
+    const text = await res.text();
+
+    // HTTP failure (5xx/network-level) always means down, regardless of body.
+    if (!res.ok) {
+      return { ok: false, degraded: false, statusCode: res.status, responseMs, error: `HTTP ${res.status}`, body: text || null };
+    }
+
+    // HTTP 200 but body reports its own degraded/down state (e.g. DB up but
+    // an external API failing) — still "reachable" but not fully healthy.
+    try {
+      const parsed = JSON.parse(text);
+      const bodyStatus = parsed?.status;
+      return {
+        ok: bodyStatus !== 'down',
+        degraded: bodyStatus === 'degraded',
+        statusCode: res.status,
+        responseMs,
+        error: bodyStatus === 'down' ? 'Service reported status: down' : null,
+        body: text,
+      };
+    } catch {
+      // 200 with an unparseable body still counts as reachable.
+      return { ok: true, degraded: false, statusCode: res.status, responseMs, error: null, body: text || null };
+    }
   } catch (err: any) {
     clearTimeout(t);
     const reason = err?.name === 'AbortError' ? `timed out after ${CHECK_TIMEOUT_MS}ms` : String(err?.message ?? err);
-    return { ok: false, statusCode: null, responseMs: Date.now() - start, error: reason };
+    return { ok: false, degraded: false, statusCode: null, responseMs: Date.now() - start, error: reason, body: null };
   }
 }
 
-/** Records one check, and opens/closes an incident once 2 consecutive checks
- *  agree — a single blip (network hiccup, cold start) shouldn't flip the
- *  page to "down" and shouldn't spam an incident log. */
+/** Records one check, updates the latest-snapshot row, and opens/closes an
+ *  incident once 2 consecutive checks agree the service is fully down — a
+ *  single blip (network hiccup, cold start) shouldn't flip the page red or
+ *  spam the incident log. Degraded states don't open incidents, only full
+ *  outages do; degraded is still visible on the page and in day coloring. */
 export async function recordCheck(db: D1Database, service: ServiceDef, result: CheckResult): Promise<void> {
   const now = new Date().toISOString();
 
   await db
-    .prepare('INSERT INTO checks (service, checked_at, ok, status_code, response_ms, error) VALUES (?, ?, ?, ?, ?, ?)')
-    .bind(service.id, now, result.ok ? 1 : 0, result.statusCode, result.responseMs, result.error)
+    .prepare('INSERT INTO checks (service, checked_at, ok, degraded, status_code, response_ms, error) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .bind(service.id, now, result.ok ? 1 : 0, result.degraded ? 1 : 0, result.statusCode, result.responseMs, result.error)
+    .run();
+
+  await db
+    .prepare(
+      `INSERT INTO snapshots (service, payload, ok, degraded, http_status, response_ms, fetched_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(service) DO UPDATE SET payload=excluded.payload, ok=excluded.ok, degraded=excluded.degraded,
+         http_status=excluded.http_status, response_ms=excluded.response_ms, fetched_at=excluded.fetched_at`
+    )
+    .bind(service.id, result.body ?? '', result.ok ? 1 : 0, result.degraded ? 1 : 0, result.statusCode, result.responseMs, now)
     .run();
 
   const last2 = await db
@@ -75,7 +114,7 @@ export async function recordCheck(db: D1Database, service: ServiceDef, result: C
   }
 
   // Cheap enough to run every tick — keeps the checks table bounded to the
-  // retention window without needing a separate cron/cleanup job.
+  // retention window without a separate cron/cleanup job.
   const cutoff = new Date(Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
   await db.prepare('DELETE FROM checks WHERE service = ? AND checked_at < ?').bind(service.id, cutoff).run();
 }
@@ -85,4 +124,17 @@ export async function runAllChecks(env: Env): Promise<void> {
     const result = await probe(service);
     await recordCheck(env.DB, service, result);
   }
+}
+
+/** Basic guard for the manual "Refresh status" button — only re-runs checks
+ *  if the most recent one is at least this old, so the endpoint can't be
+ *  hammered into spamming AniVault's own APIs and Jikan/MAL/TMDB. */
+const MIN_MANUAL_REFRESH_GAP_MS = 20_000;
+
+export async function maybeRunManualRefresh(env: Env): Promise<boolean> {
+  const latest = await env.DB.prepare('SELECT checked_at FROM checks ORDER BY checked_at DESC LIMIT 1').first<{ checked_at: string }>();
+  const lastMs = latest ? new Date(latest.checked_at).getTime() : 0;
+  if (Date.now() - lastMs < MIN_MANUAL_REFRESH_GAP_MS) return false;
+  await runAllChecks(env);
+  return true;
 }
