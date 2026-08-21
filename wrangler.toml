@@ -7,7 +7,7 @@ compatibility_date = "2024-09-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "anivault-status"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "7442ce8f-0e95-4b97-b7fb-b3d790675bed"
 
 # Pings both services every 2 minutes. 720 checks/day/service — cheap for D1,
 # and deliberately NOT KV (see src/index.ts comment: writing to KV from here
